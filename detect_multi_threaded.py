@@ -1,7 +1,11 @@
 from utils import detector_utils as detector_utils
+from sklearn.linear_model import LinearRegression
 from multiprocessing import Queue, Pool
+from collections import deque
 from utils.detector_utils import WebcamVideoStream
 import cv2
+import copy
+import numpy as np
 #import tensorflow as tf
 import tensorflow.compat.v1 as tf
 tf.disable_v2_behavior()
@@ -20,8 +24,44 @@ delta_thresh = 200
 prev_x = 0
 prev_y = 0
 
+# Correlation coefficient required for zoom to be performed
+coeff_thresh = 0.85
+
+
 HOST = '127.0.0.1'
 PORT = 31416
+
+## perform linear regression on set of points of hand
+def zoom(myQueue):
+    q = copy.deepcopy(myQueue)
+    if(len(q) != q.maxlen):
+        print("incorrect")
+        print("len is" + str(len(q)) + "maxlen is " + str(q.maxlen))
+        return "Invalid"
+    xs = list()
+    ys = list()
+    while(len(q) != 0):
+        points = q.pop()
+        for samp in points:
+            xs.append([samp[0]])
+            ys.append([samp[1]])
+    # check if sufficient number of samples due to model losing hands
+    if(len(xs) < q.maxlen*2 - 2):
+        print("insufficient data")
+        return "Invalid"
+    X = np.array(xs)
+    Y = np.array(ys)
+    lineFit = LinearRegression().fit(X, Y)
+    if(lineFit.score(X, Y) >= coeff_thresh):
+        return "zoomByFactor 3\n"
+    else:
+        return "Invalid"
+
+
+    
+
+
+
 
 # Create a worker thread that loads graph and
 # does detection on images in an input queue and puts it on an output queue
@@ -67,16 +107,18 @@ def worker(input_q, output_q, midpoint_q, cap_params, frame_processed):
 
 
 
-def send_message(style, delta_x, delta_y):
+def send_message(style, argo):
     body = {}
     body['type'] = 'move'
     if style == "rotate":    
         body['style'] = style
-        body['x'] = delta_x
-        body['y'] = delta_y
+        body['x'] = argo[0]
+        body['y'] = argo[1]
     if style == "translate": 
         pass
     if style == "zoom":
+        body['style'] = style
+        body['scale'] = argo[0]
         pass
     print(body)
     conn.sendall(bytes(json.dumps(body) + '\n', 'utf-8'))
@@ -165,6 +207,16 @@ if __name__ == '__main__':
     output_q = Queue(maxsize=args.queue_size)
     midpoint_q = Queue(maxsize=args.queue_size)
 
+    wrapper_q = deque(maxlen=args.queue_size)
+    wrapper_q.append([[1,1],[1,1]])
+    wrapper_q.append([[2,2],[2,2]])
+    wrapper_q.append([[3,3],[3,3]])
+    wrapper_q.append([[4,4],[4,4]])
+    wrapper_q.append([[5,5],[5,5]])
+
+
+
+
     video_capture = WebcamVideoStream(src=args.video_source, width=args.width, height=args.height).start()
 
     frame_processed = 0
@@ -198,23 +250,30 @@ if __name__ == '__main__':
                 num_frames += 1
                 fps = num_frames / elapsed_time
                 print("frame",  frame_index, num_frames, elapsed_time, fps)
-
+                
                 # Determine Gesture
                 midpoint_data = midpoint_q.get()
+                wrapper_q.append(midpoint_data)
+                zoomFac = zoom(wrapper_q)
+                if(zoomFac != "Invalid"):
+                    send_message("zoom", [2])
                 if len(midpoint_data): 
                     delta_x = 0
                     delta_y = 0
-                    if prev_x != 0 and prev_y != 0: 
-                        delta_x = midpoint_data[0][0] - prev_x
-                        delta_y = midpoint_data[0][1] - prev_y
+                    if prev_x != 0 and prev_y != 0:
+                        delts = []
+                        delts[0] = midpoint_data[0][0] - prev_x
+                        delts[1] = midpoint_data[0][1] - prev_y
                         if(args.flip_x):
-                            delta_x *= -1
+                            delts[0] *= -1
                         if(args.flip_y): 
-                            delta_y *= -1
-                        if abs(delta_x) < delta_thresh and abs(delta_y) < delta_thresh:
-                            send_message('rotate', delta_x, delta_y)
+                            delts[1] *= -1
+                        if abs(delts[0]) < delta_thresh and abs(delts[1]) < delta_thresh:
+                            send_message('rotate', delts)
                     prev_x = midpoint_data[0][0]
                     prev_y = midpoint_data[0][1]
+                if(len(wrapper_q) == wrapper_q.maxlen):
+                    wrapper_q.pop()
                 
                 # Display
                 if output_frame is not None:
